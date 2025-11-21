@@ -1,17 +1,28 @@
-# IncognitoEscrow – Privacy-Preserving ERC20 Escrow  
-
-![Architecture Overview](https://github.com/fxg4n/incognito-escrow/blob/main/docs/images/architecture.png)
-
-Lightweight escrow contract hides both sender and receiver addresses from the public blockchain.
-
-## Frontend Integration Example
+## Quick Start (Hardhat / Foundry)
 
 ```js
+// Deploy
+const escrow = await ethers.deployContract("IncognitoEscrow", [
+  ownerAddress,      // initialOwner (multisig recommended)
+  verifierAddress,   // your ZK verifier contract
+  initialMerkleRoot, // bytes32
+  feeRecipient       // treasury address
+]);
+await escrow.waitForDeployment();
+```
+
+## Frontend Integration (ethers.js v6)
+
+```ts
 import { ethers } from "ethers";
 
-// Generate 64-byte encrypted commitment (sender + receiver hidden)
-async function createCommitment(sender, receiver, secret) {
-  const key = ethers.getBytes(ethers.keccak256(ethers.toUtf8Bytes(secret)));
+// Generate encrypted commitment (64 bytes)
+async function createCommitment(
+  sender: string,
+  receiver: string,
+  secret: string
+): Promise<string> {
+  const key = ethers.keccak256(ethers.toUtf8Bytes(secret));
   const keystream = ethers.concat([key, key]); // 64 bytes
 
   const plain = ethers.concat([
@@ -19,99 +30,166 @@ async function createCommitment(sender, receiver, secret) {
     ethers.zeroPadValue(receiver, 32)
   ]);
 
-  const commitment = ethers.concat(
-    Array.from({ length: 64 }, (_, i) => plain[i] ^ keystream[i])
-  );
+  const commitmentBytes = new Uint8Array(64);
+  for (let i = 0; i < 64; i++) {
+    commitmentBytes[i] = plain[i] ^ keystream[i];
+  }
 
-  return commitment; // 64 raw bytes
+  return ethers.hexlify(commitmentBytes); // 0x + 128 hex chars
 }
 
-// Deposit into escrow (buyer / sender side)
-async function depositEscrow({ token, escrow, receiver, amount, secret }) {
-  const sender = await ethers.provider.getSigner().getAddress();
+// Deposit – Sender / Buyer
+async function deposit({
+  token,
+  escrow,
+  receiver,
+  amount,
+  secret
+}: {
+  token: ethers.Contract;
+  escrow: ethers.Contract;
+  receiver: string;
+  amount: bigint;
+  secret: string;
+}) {
+  const sender = await escrow.signer.getAddress();
   const commitment = await createCommitment(sender, receiver, secret);
   const commitmentHash = ethers.keccak256(commitment);
 
   // 1. Approve
-  await (await token.approve(escrow.target, amount)).wait();
+  await (await token.approve(await escrow.getAddress(), amount)).wait();
 
   // 2. Deposit
-  const tx = await escrow.transact(token.target, commitment, amount);
+  const tx = await escrow.transact(
+    await token.getAddress(),
+    commitment,    // 64-byte encrypted blob
+    amount
+  );
   await tx.wait();
 
   console.log("Private escrow created!");
-  console.log("Transaction ID:", commitmentHash);
-  console.log("Secret (share securely with counterparty):", secret);
+  console.log("ID (share with receiver):", commitmentHash);
+  console.log("Secret (keep safe):", secret);
 
   return { commitmentHash, secret };
 }
 ```
 
-## On-Chain Explorer View – What the Public Actually Sees
+### Receiver Claims (after operator calls `release()`)
 
-### Phase 1: Deposit (Standard Block Explorer – Etherscan, Basescan, etc.)
-
-```text
-Method called: transact(IERC20, bytes, uint256)
-
-Parameters:
-  tokenAddress:   0xdAC17F958D2ee523a2206206994597C13D831ec7 (USDT)
-  commitment:     0x4f8a2b1c9d3e7f6a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4
-                  0x11223344556677889900aabbccddeeff00112233445566778899aabbccddeeff
-                  ← 64 random-looking bytes (132 hex chars total)
-  grossAmount:    1,000,000,000 (1,000.00 USDT)
-
-ERC20 Transfers triggered:
-  From: 0x71C7…a8F3 (Alice – only visible because she submitted the tx)
-  To:   IncognitoEscrow
-  Amount: 1,000.00 USDT
+```ts
+await escrow.claim(proof); // proof generated off-chain with secret
 ```
 
-**Critical point:** No receiver address appears anywhere.  
-Bots, MEV searchers, and public dashboards cannot link this deposit to Bob.
+### Sender Cancels or Forwards
 
-### Phase 2: While Funds Are Locked (Your Private Dashboard / Explorer Plugin)
-
-Query via `getTransaction(commitmentHash)` → shows clean readable view:
-
-```text
-╔══════════════════════════════════════════════════════════════╗
-║                     IncognitoEscrow Transaction              ║
-╠══════════════════════════════════════════════════════════════╣
-║ Transaction ID   0x8f71d1c0f7e3b9a2c6d5e4f3a2b1c0d9e8f7g6h5i4j3k2l1m0n9o8p7q6r5  
-║ Token            USDT (Tether)                                       
-║ Amount           1,000.00 USDT                                           
-║ Status           Locked      (7-day sender bypass in 6d 18h 24m)         
-║ Created          November 20, 2025 14:32:18 GMT+7                        
-║ Commitment Blob  0x4f8a2b1c… (64 bytes – encrypted)                    
-╚══════════════════════════════════════════════════════════════╝
+```ts
+await escrow.cancel(proof);   // anytime while Ongoing
+await escrow.forward(proof);  // after forwardWait (default 7 days)
 ```
 
-### Phase 3: Settlement (Release / Refund / Forward)
+## Blockchain Explorer View
 
-Standard explorer only sees:
-
-```text
-ERC20 Transfer:
-  From: IncognitoEscrow
-  To:   0x19d4…e3F7   ← looks like a random address to the public
-  Amount: 1,000.00 USDT
-```
-
-Your private dashboard updates to:
+### 1. `transact()` – Deposit
 
 ```text
-Status           Released
-Settled          November 21, 2025 09:11:05 GMT+7
-Recipient        0xBob…1234   (only visible to operator or parties with the secret)
+Function: transact(IERC20 token, bytes32 commitment, uint256 amount)
+
+Parameters
+├─ token:      0xdAC17F958D2ee523a2206206994597C13D831ec7 (USDT)
+├─ commitment: 0x4f8a2b1c9d3e7f6a1b2c3d4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5071829
+                0x3a4b5c6d7e8f9a0b1c2d3e4f50718293a4b5c6d7e8f9a0b1c2d3e4f50718293a4
+                ← 64 bytes (128 hex chars) of pure cryptographic noise
+└─ amount:     1_000_000_000 (1,000.00 USDT)
+
+Internal ERC20 Transfer
+  From → 0x71C765...a8F3
+  To   → IncognitoEscrow
+  Value: 1,000.00 USDT
+
+Event
+  Transacted(0xdAC17F958D2ee5... , 1000000000)
 ```
 
-### Privacy Comparison Table (Public vs Private View)
+---
 
-| Information              | Public Explorer (Etherscan etc.) | Your Private Dashboard / Operator |
-|--------------------------|----------------------------------|------------------------------------|
-| Original sender          | Only visible in deposit tx       | Yes (after decryption)            |
-| Final receiver           | Never visible                    | Yes (after decryption)            |
-| Commitment (encrypted)   | Visible (looks random)           | Visible + decryptable             |
-| Transaction purpose      | Unknown                          | Fully known                       |
-| Linkability to trade     | Impossible without secret        | 1:1 mapping                       |
+### 2. `release()` – Owner
+
+```text
+Function: release(bytes proof)
+
+proof: 0x8a9f7b6c5d4e3f2a1b...
+
+Event: Released()
+```
+
+---
+
+### 3. `claim()` – Receiver withdraws
+
+```text
+Function: claim(bytes proof)
+
+Internal ERC20 Transfers
+  From → IncognitoEscrow
+  To   → 0x19d4C1...2eF7
+  Value: 999.50 USDT
+
+  From → IncognitoEscrow
+  To   → 0xFeeRecipient...
+  Value: 0.50 USDT (protocol fee)
+
+Event
+  Claimed(0x19d4C1...2eF7, 999500000, 500000)
+```
+
+---
+
+### 4. `cancel()` – Sender cancels & gets refund
+
+```text
+Function: cancel(bytes proof)
+
+Internal ERC20 Transfer
+  From → IncognitoEscrow
+  To   → 0x71C765...a8F3
+  Value: 1,000.00 USDT
+
+Event: Canceled()
+```
+
+---
+
+### 5. `forward()` – Sender force-releases after timeout
+
+```text
+Function: forward(bytes proof)
+
+Event: Forwarded()
+
+Internal ERC20 Transfers
+  From → IncognitoEscrow
+  To   → 0x19d4C1...2eF7 (random-looking address)
+  Value: 999.50 USDT + 0.50 USDT fee
+```
+
+---
+
+### 6. `getTxStatus()` – Check status
+
+```text
+Ongoing
+```
+---
+
+## Public Visibility Summary
+
+| Information                    | Visible on Public Explorer |
+|--------------------------------|----------------------------|
+| Sender address                 | Yes (only in `transact`)   |
+| Receiver address               | No                         |
+| 64-byte commitment             | Yes                        |
+| Commitment hash (tx ID)        | No                         |
+| Deposit → withdrawal link      | No                         |
+| Trade purpose / counterparty   | No                         |
+| MEV / analytics signal         | No                         |
